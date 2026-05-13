@@ -37,6 +37,7 @@ type QueryParam struct {
 	Keys     datasource.Keys `json:"keys" mapstructure:"keys"`
 	From     interface{}     `json:"from" mapstructure:"from"`
 	To       interface{}     `json:"to" mapstructure:"to"`
+	Interval int64           `json:"interval" mapstructure:"interval"`
 	Limit    int             `json:"limit" mapstructure:"limit"`
 }
 
@@ -189,7 +190,7 @@ func (it *IoTDB) queryRows(ctx context.Context, queryParam *QueryParam) ([]map[s
 		return nil, fmt.Errorf("sql is required")
 	}
 
-	hasMacro := strings.Contains(sqlText, "$__")
+	hasMacro := strings.Contains(sqlText, "$__") || strings.Contains(sqlText, "${__")
 	if hasMacro {
 		from, err := parseQueryTime(queryParam.From)
 		if err != nil {
@@ -199,12 +200,14 @@ func (it *IoTDB) queryRows(ctx context.Context, queryParam *QueryParam) ([]map[s
 		if err != nil {
 			return nil, fmt.Errorf("parse to failed: %w", err)
 		}
+		sqlText = replaceIoTDBMacros(sqlText, queryParam, from, to)
 		sqlText, err = macros.Macro(sqlText, from, to)
 		if err != nil {
 			return nil, err
 		}
 	} else {
 		var err error
+		sqlText = autoDownsampleSQL(sqlText, queryParam)
 		sqlText, err = appendTimeFilter(sqlText, queryParam)
 		if err != nil {
 			return nil, err
@@ -432,7 +435,130 @@ func scaleEpoch(ts int64) int64 {
 var (
 	explicitTimeFilterOperators = []string{">=", "<=", "<>", "!=", ">", "<", "="}
 	sqlTailClauses              = []string{"group by", "having", "fill", "order by", "offset", "limit"}
+	sqlGroupInsertClauses       = []string{"having", "fill", "order by", "offset", "limit"}
+	timeFilterMacroPattern      = regexp.MustCompile(`\$__timeFilter\(\s*([^)]+?)\s*\)`)
+	timeGroupMacroPattern       = regexp.MustCompile(`\$__timeGroup\(\s*([^,)]+?)\s*(?:,\s*([^)]+?))?\s*\)`)
 )
+
+func replaceIoTDBMacros(sqlText string, queryParam *QueryParam, from, to int64) string {
+	timeKey := strings.TrimSpace(queryParam.Keys.TimeKey)
+	if timeKey == "" {
+		timeKey = "time"
+	}
+
+	intervalSecondsValue := intervalSeconds(queryParam.Interval)
+	if intervalSecondsValue <= 0 {
+		intervalSecondsValue = defaultIntervalFromRange(from, to)
+	}
+	interval := formatIoTDBInterval(intervalSecondsValue)
+	if interval == "" {
+		interval = "60s"
+		intervalSecondsValue = 60
+	}
+
+	sqlText = strings.ReplaceAll(sqlText, "$__interval_ms", strconv.FormatInt(intervalSecondsValue*1000, 10))
+	sqlText = strings.ReplaceAll(sqlText, "${__interval_ms}", strconv.FormatInt(intervalSecondsValue*1000, 10))
+	sqlText = strings.ReplaceAll(sqlText, "$__interval", interval)
+	sqlText = strings.ReplaceAll(sqlText, "${__interval}", interval)
+	sqlText = timeFilterMacroPattern.ReplaceAllStringFunc(sqlText, func(match string) string {
+		parts := timeFilterMacroPattern.FindStringSubmatch(match)
+		field := timeKey
+		if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
+			field = strings.TrimSpace(parts[1])
+		}
+		condition, err := buildTimeFilterCondition(field, queryParam.From, queryParam.To)
+		if err != nil || condition == "" {
+			return "1=1"
+		}
+		return condition
+	})
+	sqlText = timeGroupMacroPattern.ReplaceAllStringFunc(sqlText, func(match string) string {
+		parts := timeGroupMacroPattern.FindStringSubmatch(match)
+		field := timeKey
+		if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
+			field = strings.TrimSpace(parts[1])
+		}
+		bucket := interval
+		if len(parts) > 2 && strings.TrimSpace(parts[2]) != "" {
+			bucket = strings.TrimSpace(parts[2])
+		}
+		return fmt.Sprintf("date_bin(%s, %s)", bucket, field)
+	})
+
+	return sqlText
+}
+
+func autoDownsampleSQL(sqlText string, queryParam *QueryParam) string {
+	if queryParam.Interval <= 0 {
+		return sqlText
+	}
+
+	timeKey := strings.TrimSpace(queryParam.Keys.TimeKey)
+	if timeKey == "" {
+		timeKey = "time"
+	}
+	valueKeys := splitSQLKeys(queryParam.Keys.ValueKey)
+	if len(valueKeys) == 0 || !allSafeSQLIdentifiers(valueKeys) {
+		return sqlText
+	}
+	labelKeys := splitSQLKeys(queryParam.Keys.LabelKey)
+	if !allSafeSQLIdentifiers(labelKeys) {
+		return sqlText
+	}
+
+	trimmed := strings.TrimSpace(sqlText)
+	suffix := ""
+	if strings.HasSuffix(trimmed, ";") {
+		trimmed = strings.TrimSpace(strings.TrimSuffix(trimmed, ";"))
+		suffix = ";"
+	}
+
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, "date_bin(") ||
+		findTopLevelKeyword(trimmed, "group by") >= 0 ||
+		findTopLevelKeyword(trimmed, "union") >= 0 ||
+		findTopLevelKeyword(trimmed, "join") >= 0 {
+		return sqlText
+	}
+
+	selectIdx := findTopLevelKeyword(trimmed, "select")
+	fromIdx := findTopLevelKeyword(trimmed, "from")
+	if selectIdx != 0 || fromIdx < 0 {
+		return sqlText
+	}
+
+	selectList := strings.TrimSpace(trimmed[len("select"):fromIdx])
+	if selectList == "*" || strings.Contains(selectList, "*") || hasTopLevelAggregate(selectList) {
+		return sqlText
+	}
+
+	interval := formatIoTDBInterval(queryParam.Interval)
+	if interval == "" {
+		return sqlText
+	}
+
+	timeRef := sqlIdentifierRef(timeKey)
+	timeAlias := sqlIdentifierAlias(timeKey)
+	selectParts := []string{fmt.Sprintf("date_bin(%s, %s) as %s", interval, timeRef, sqlIdentifierRef(timeAlias))}
+	for _, labelKey := range labelKeys {
+		selectParts = append(selectParts, sqlIdentifierRef(labelKey))
+	}
+	for _, valueKey := range valueKeys {
+		selectParts = append(selectParts, fmt.Sprintf("avg(%s) as %s", sqlIdentifierRef(valueKey), sqlIdentifierRef(sqlIdentifierAlias(valueKey))))
+	}
+
+	downsampled := "select " + strings.Join(selectParts, ", ") + " " + strings.TrimSpace(trimmed[fromIdx:])
+	groupParts := []string{fmt.Sprintf("date_bin(%s, %s)", interval, timeRef)}
+	for _, labelKey := range labelKeys {
+		groupParts = append(groupParts, sqlIdentifierRef(labelKey))
+	}
+	downsampled = insertGroupByCondition(downsampled, strings.Join(groupParts, ", "))
+	if findTopLevelKeyword(downsampled, "order by") < 0 {
+		downsampled = insertOrderByTime(downsampled, sqlIdentifierRef(timeAlias))
+	}
+
+	return downsampled + suffix
+}
 
 func appendTimeFilter(sqlText string, queryParam *QueryParam) (string, error) {
 	timeKey := strings.TrimSpace(queryParam.Keys.TimeKey)
@@ -587,14 +713,179 @@ func insertWhereCondition(sqlText, condition string) string {
 	return result + suffix
 }
 
+func insertGroupByCondition(sqlText, groupBy string) string {
+	if groupBy == "" || findTopLevelKeyword(sqlText, "group by") >= 0 {
+		return sqlText
+	}
+	insertAt := findInsertBeforeAnyClause(sqlText, sqlGroupInsertClauses)
+	head := strings.TrimRightFunc(sqlText[:insertAt], unicode.IsSpace)
+	tail := strings.TrimLeftFunc(sqlText[insertAt:], unicode.IsSpace)
+
+	result := head + " GROUP BY " + groupBy
+	if tail != "" {
+		result += " " + tail
+	}
+	return result
+}
+
+func insertOrderByTime(sqlText, timeKey string) string {
+	insertAt := findInsertBeforeAnyClause(sqlText, []string{"offset", "limit"})
+	head := strings.TrimRightFunc(sqlText[:insertAt], unicode.IsSpace)
+	tail := strings.TrimLeftFunc(sqlText[insertAt:], unicode.IsSpace)
+
+	result := head + " ORDER BY " + timeKey
+	if tail != "" {
+		result += " " + tail
+	}
+	return result
+}
+
 func findInsertBeforeClause(sqlText string) int {
+	return findInsertBeforeAnyClause(sqlText, sqlTailClauses)
+}
+
+func findInsertBeforeAnyClause(sqlText string, clauses []string) int {
 	insertAt := len(sqlText)
-	for _, clause := range sqlTailClauses {
+	for _, clause := range clauses {
 		if idx := findTopLevelKeyword(sqlText, clause); idx >= 0 && idx < insertAt {
 			insertAt = idx
 		}
 	}
 	return insertAt
+}
+
+func splitSQLKeys(value string) []string {
+	keys := strings.Fields(strings.TrimSpace(value))
+	if len(keys) == 1 && strings.Contains(keys[0], ",") {
+		keys = strings.Split(keys[0], ",")
+	}
+
+	normalized := make([]string, 0, len(keys))
+	for _, key := range keys {
+		key = strings.Trim(strings.TrimSpace(key), ",")
+		if key != "" {
+			normalized = append(normalized, key)
+		}
+	}
+	return normalized
+}
+
+func allSafeSQLIdentifiers(values []string) bool {
+	for _, value := range values {
+		if !isSafeSQLIdentifier(value) {
+			return false
+		}
+	}
+	return true
+}
+
+func isSafeSQLIdentifier(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	parts := strings.Split(value, ".")
+	for _, part := range parts {
+		part = strings.Trim(part, "`\"")
+		if part == "" {
+			return false
+		}
+		for i, r := range part {
+			if i == 0 && !(r == '_' || unicode.IsLetter(r)) {
+				return false
+			}
+			if !(r == '_' || r == ':' || unicode.IsLetter(r) || unicode.IsDigit(r)) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func sqlIdentifierRef(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return value
+	}
+	parts := strings.Split(value, ".")
+	quoted := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.Trim(strings.TrimSpace(part), "`\"")
+		if isSimpleSQLIdentifierPart(part) {
+			quoted = append(quoted, part)
+			continue
+		}
+		quoted = append(quoted, `"`+strings.ReplaceAll(part, `"`, `""`)+`"`)
+	}
+	return strings.Join(quoted, ".")
+}
+
+func sqlIdentifierAlias(value string) string {
+	parts := strings.Split(strings.TrimSpace(value), ".")
+	alias := strings.Trim(parts[len(parts)-1], "`\"")
+	if alias == "" {
+		return value
+	}
+	return alias
+}
+
+func isSimpleSQLIdentifierPart(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i, r := range value {
+		if i == 0 && !(r == '_' || unicode.IsLetter(r)) {
+			return false
+		}
+		if !(r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)) {
+			return false
+		}
+	}
+	return true
+}
+
+func hasTopLevelAggregate(selectList string) bool {
+	for _, fn := range []string{"avg", "count", "sum", "min", "max", "first", "last", "date_bin"} {
+		if findTopLevelKeyword(selectList, fn) >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func formatIoTDBInterval(seconds int64) string {
+	seconds = intervalSeconds(seconds)
+	if seconds <= 0 {
+		return ""
+	}
+	if seconds%86400 == 0 {
+		return fmt.Sprintf("%dd", seconds/86400)
+	}
+	if seconds%3600 == 0 {
+		return fmt.Sprintf("%dh", seconds/3600)
+	}
+	if seconds%60 == 0 {
+		return fmt.Sprintf("%dm", seconds/60)
+	}
+	return fmt.Sprintf("%ds", seconds)
+}
+
+func intervalSeconds(interval int64) int64 {
+	if interval >= 1e12 {
+		return interval / 1e3
+	}
+	return interval
+}
+
+func defaultIntervalFromRange(from, to int64) int64 {
+	if from <= 0 || to <= from {
+		return 60
+	}
+	interval := (to - from) / 240
+	if interval < 1 {
+		return 1
+	}
+	return interval
 }
 
 func findTopLevelKeyword(sqlText, keyword string) int {

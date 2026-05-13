@@ -156,6 +156,84 @@ func TestAppendTimeFilterSkipWhenNoRange(t *testing.T) {
 	}
 }
 
+func TestAutoDownsampleSQL(t *testing.T) {
+	got := autoDownsampleSQL("select time, cache_hit from datanode.cache_hit", &QueryParam{
+		Interval: 60,
+		Keys: datasource.Keys{
+			ValueKey: "cache_hit",
+			TimeKey:  "time",
+		},
+	})
+
+	want := "select date_bin(1m, time) as time, avg(cache_hit) as cache_hit from datanode.cache_hit GROUP BY date_bin(1m, time) ORDER BY time"
+	if got != want {
+		t.Fatalf("unexpected sql:\nwant: %s\ngot:  %s", want, got)
+	}
+}
+
+func TestAutoDownsampleSQLWithLabelAndWhereLimit(t *testing.T) {
+	got := autoDownsampleSQL("select time, cache_hit, node_id from datanode.cache_hit where node_id = 'n1' limit 100", &QueryParam{
+		Interval: 300,
+		Keys: datasource.Keys{
+			ValueKey: "cache_hit",
+			LabelKey: "node_id",
+			TimeKey:  "time",
+		},
+	})
+
+	want := "select date_bin(5m, time) as time, node_id, avg(cache_hit) as cache_hit from datanode.cache_hit where node_id = 'n1' GROUP BY date_bin(5m, time), node_id ORDER BY time limit 100"
+	if got != want {
+		t.Fatalf("unexpected sql:\nwant: %s\ngot:  %s", want, got)
+	}
+}
+
+func TestAutoDownsampleSQLWithQuotedPrometheusMetricName(t *testing.T) {
+	got := autoDownsampleSQL(`select time, "timer_service:request_total", model_id from timer_service."timer_service:request"`, &QueryParam{
+		Interval: 60,
+		Keys: datasource.Keys{
+			ValueKey: "timer_service:request_total",
+			LabelKey: "model_id",
+			TimeKey:  "time",
+		},
+	})
+
+	want := `select date_bin(1m, time) as time, model_id, avg("timer_service:request_total") as "timer_service:request_total" from timer_service."timer_service:request" GROUP BY date_bin(1m, time), model_id ORDER BY time`
+	if got != want {
+		t.Fatalf("unexpected sql:\nwant: %s\ngot:  %s", want, got)
+	}
+}
+
+func TestAutoDownsampleSQLSkipComplexQuery(t *testing.T) {
+	original := "select date_bin(1m, time) as time, avg(cache_hit) as cache_hit from datanode.cache_hit group by date_bin(1m, time)"
+	got := autoDownsampleSQL(original, &QueryParam{
+		Interval: 60,
+		Keys:     datasource.Keys{ValueKey: "cache_hit", TimeKey: "time"},
+	})
+
+	if got != original {
+		t.Fatalf("complex sql should stay unchanged:\nwant: %s\ngot:  %s", original, got)
+	}
+}
+
+func TestReplaceIoTDBMacros(t *testing.T) {
+	got := replaceIoTDBMacros(
+		"select $__timeGroup(time,$__interval) as time, avg(cache_hit) as cache_hit from datanode.cache_hit where $__timeFilter(time) group by $__timeGroup(time,$__interval)",
+		&QueryParam{
+			From:     "2026-05-11T10:00:00.000Z",
+			To:       "2026-05-11T11:00:00.000Z",
+			Interval: 60,
+			Keys:     datasource.Keys{TimeKey: "time"},
+		},
+		1778493600,
+		1778497200,
+	)
+
+	want := "select date_bin(1m, time) as time, avg(cache_hit) as cache_hit from datanode.cache_hit where time >= 1778493600000 AND time <= 1778497200000 group by date_bin(1m, time)"
+	if got != want {
+		t.Fatalf("unexpected sql:\nwant: %s\ngot:  %s", want, got)
+	}
+}
+
 func queryParamWithRange(timeKey string) *QueryParam {
 	return &QueryParam{
 		From: "2026-05-11T10:00:00.000Z",

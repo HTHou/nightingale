@@ -215,6 +215,22 @@ func TestAutoDownsampleSQLSkipComplexQuery(t *testing.T) {
 	}
 }
 
+func TestAutoDownsampleSQLSkipDiffQuery(t *testing.T) {
+	original := `SELECT time, diff("timer_service:request_total") / 15 AS "timer_service:request_total", model_id, status FROM timer_service."timer_service:request" WHERE model_id = 'Chronos-2' ORDER BY time`
+	got := autoDownsampleSQL(original, &QueryParam{
+		Interval: 15,
+		Keys: datasource.Keys{
+			ValueKey: "timer_service:request_total",
+			LabelKey: "model_id status",
+			TimeKey:  "time",
+		},
+	})
+
+	if got != original {
+		t.Fatalf("diff sql should stay unchanged:\nwant: %s\ngot:  %s", original, got)
+	}
+}
+
 func TestReplaceIoTDBMacros(t *testing.T) {
 	got := replaceIoTDBMacros(
 		"select $__timeGroup(time,$__interval) as time, avg(cache_hit) as cache_hit from datanode.cache_hit where $__timeFilter(time) group by $__timeGroup(time,$__interval)",

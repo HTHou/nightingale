@@ -845,7 +845,7 @@ func isSimpleSQLIdentifierPart(value string) bool {
 }
 
 func hasTopLevelAggregate(selectList string) bool {
-	for _, fn := range []string{"avg", "count", "sum", "min", "max", "first", "last", "date_bin"} {
+	for _, fn := range []string{"avg", "count", "sum", "min", "max", "first", "last", "date_bin", "diff"} {
 		if findTopLevelKeyword(selectList, fn) >= 0 {
 			return true
 		}
